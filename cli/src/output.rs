@@ -220,7 +220,22 @@ pub fn print_response(resp: &Response, json_mode: bool) {
             }
             return;
         }
-        // Screenshot path (no "started" or "frames" field)
+        // Download response (has "suggestedFilename" or "filename" field)
+        if data.get("suggestedFilename").is_some() || data.get("filename").is_some() {
+            if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
+                let filename = data.get("suggestedFilename")
+                    .or_else(|| data.get("filename"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if filename.is_empty() {
+                    println!("{} Downloaded to {}", color::success_indicator(), color::green(path));
+                } else {
+                    println!("{} Downloaded to {} ({})", color::success_indicator(), color::green(path), filename);
+                }
+                return;
+            }
+        }
+        // Screenshot path (no "started", "frames", or download fields)
         if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
             println!("{} Screenshot saved to {}", color::success_indicator(), color::green(path));
             return;
