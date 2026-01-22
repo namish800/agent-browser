@@ -17,6 +17,8 @@ pub enum ParseError {
         context: String,
         usage: &'static str,
     },
+    /// Argument exists but has an invalid value
+    InvalidValue { message: String, usage: &'static str },
 }
 
 impl ParseError {
@@ -40,6 +42,9 @@ impl ParseError {
                     "Missing arguments for: {}\nUsage: agent-browser {}",
                     context, usage
                 )
+            }
+            ParseError::InvalidValue { message, usage } => {
+                format!("{}\nUsage: agent-browser {}", message, usage)
             }
         }
     }
@@ -227,7 +232,10 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
         // === Scroll ===
         "scroll" => {
             let dir = rest.get(0).unwrap_or(&"down");
-            let amount = rest.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(300);
+            let amount = rest
+                .get(1)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(300);
             Ok(json!({ "id": id, "action": "scroll", "direction": dir, "amount": amount }))
         }
         "scrollintoview" | "scrollinto" => {
@@ -242,39 +250,49 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
         "wait" => {
             // Check for --url flag: wait --url "**/dashboard"
             if let Some(idx) = rest.iter().position(|&s| s == "--url" || s == "-u") {
-                let url = rest.get(idx + 1).ok_or_else(|| ParseError::MissingArguments {
-                    context: "wait --url".to_string(),
-                    usage: "wait --url <pattern>",
-                })?;
+                let url = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --url".to_string(),
+                        usage: "wait --url <pattern>",
+                    })?;
                 return Ok(json!({ "id": id, "action": "waitforurl", "url": url }));
             }
-            
+
             // Check for --load flag: wait --load networkidle
             if let Some(idx) = rest.iter().position(|&s| s == "--load" || s == "-l") {
-                let state = rest.get(idx + 1).ok_or_else(|| ParseError::MissingArguments {
-                    context: "wait --load".to_string(),
-                    usage: "wait --load <state>",
-                })?;
+                let state = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --load".to_string(),
+                        usage: "wait --load <state>",
+                    })?;
                 return Ok(json!({ "id": id, "action": "waitforloadstate", "state": state }));
             }
-            
+
             // Check for --fn flag: wait --fn "window.ready === true"
             if let Some(idx) = rest.iter().position(|&s| s == "--fn" || s == "-f") {
-                let expr = rest.get(idx + 1).ok_or_else(|| ParseError::MissingArguments {
-                    context: "wait --fn".to_string(),
-                    usage: "wait --fn <expression>",
-                })?;
+                let expr = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --fn".to_string(),
+                        usage: "wait --fn <expression>",
+                    })?;
                 return Ok(json!({ "id": id, "action": "waitforfunction", "expression": expr }));
             }
-            
+
             // Check for --text flag: wait --text "Welcome"
             if let Some(idx) = rest.iter().position(|&s| s == "--text" || s == "-t") {
-                let text = rest.get(idx + 1).ok_or_else(|| ParseError::MissingArguments {
-                    context: "wait --text".to_string(),
-                    usage: "wait --text <text>",
-                })?;
+                let text = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --text".to_string(),
+                        usage: "wait --text <text>",
+                    })?;
                 // Use getByText locator to wait for text to appear
-                return Ok(json!({ "id": id, "action": "wait", "selector": format!("text={}", text) }));
+                return Ok(
+                    json!({ "id": id, "action": "wait", "selector": format!("text={}", text) }),
+                );
             }
 
             // Check for --download flag: wait --download [path] [--timeout ms]
@@ -301,7 +319,9 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
             // Default: selector or timeout
             if let Some(arg) = rest.get(0) {
                 if arg.parse::<u64>().is_ok() {
-                    Ok(json!({ "id": id, "action": "wait", "timeout": arg.parse::<u64>().unwrap() }))
+                    Ok(
+                        json!({ "id": id, "action": "wait", "timeout": arg.parse::<u64>().unwrap() }),
+                    )
                 } else {
                     Ok(json!({ "id": id, "action": "wait", "selector": arg }))
                 }
@@ -371,15 +391,48 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
 
         // === Connect (CDP) ===
         "connect" => {
-            let port_str = rest.get(0).ok_or_else(|| ParseError::MissingArguments {
+            let endpoint = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "connect".to_string(),
-                usage: "connect <port>",
+                usage: "connect <port|url>",
             })?;
-            let port: u16 = port_str.parse().map_err(|_| ParseError::MissingArguments {
-                context: format!("connect: invalid port '{}'", port_str),
-                usage: "connect <port>",
-            })?;
-            Ok(json!({ "id": id, "action": "launch", "cdpPort": port }))
+            // Check if it's a URL (ws://, wss://, http://, https://)
+            if endpoint.starts_with("ws://")
+                || endpoint.starts_with("wss://")
+                || endpoint.starts_with("http://")
+                || endpoint.starts_with("https://")
+            {
+                Ok(json!({ "id": id, "action": "launch", "cdpUrl": endpoint }))
+            } else {
+                // It's a port number - validate and use cdpPort field
+                let port: u16 = match endpoint.parse::<u32>() {
+                    Ok(p) if p == 0 => {
+                        return Err(ParseError::InvalidValue {
+                            message: "Invalid port: port must be greater than 0".to_string(),
+                            usage: "connect <port|url>",
+                        });
+                    }
+                    Ok(p) if p > 65535 => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!(
+                                "Invalid port: {} is out of range (valid range: 1-65535)",
+                                p
+                            ),
+                            usage: "connect <port|url>",
+                        });
+                    }
+                    Ok(p) => p as u16,
+                    Err(_) => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!(
+                                "Invalid value: '{}' is not a valid port number or URL",
+                                endpoint
+                            ),
+                            usage: "connect <port|url>",
+                        });
+                    }
+                };
+                Ok(json!({ "id": id, "action": "launch", "cdpPort": port }))
+            }
         }
 
         // === Get ===
@@ -416,7 +469,9 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
                         context: "cookies set".to_string(),
                         usage: "cookies set <name> <value>",
                     })?;
-                    Ok(json!({ "id": id, "action": "cookies_set", "cookies": [{ "name": name, "value": value }] }))
+                    Ok(
+                        json!({ "id": id, "action": "cookies_set", "cookies": [{ "name": name, "value": value }] }),
+                    )
                 }
                 "clear" => Ok(json!({ "id": id, "action": "cookies_clear" })),
                 _ => Ok(json!({ "id": id, "action": "cookies_get" })),
@@ -446,7 +501,7 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
                 }
                 _ => Ok(json!({ "id": id, "action": "tab_list" })),
             }
-        }
+        },
 
         // === Window ===
         "window" => {
@@ -488,7 +543,6 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
                     }
                     Ok(cmd)
                 }
-                Some("dismiss") => Ok(json!({ "id": id, "action": "dialog", "response": "dismiss" })),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
                     valid_options: VALID,
@@ -699,7 +753,7 @@ fn parse_get(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 
 fn parse_is(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["visible", "enabled", "checked"];
-    
+
     match rest.get(0).map(|s| *s) {
         Some("visible") => {
             let sel = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -734,19 +788,31 @@ fn parse_is(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 }
 
 fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
-    const VALID: &[&str] = &["role", "text", "label", "placeholder", "alt", "title", "testid", "first", "last", "nth"];
-    
+    const VALID: &[&str] = &[
+        "role",
+        "text",
+        "label",
+        "placeholder",
+        "alt",
+        "title",
+        "testid",
+        "first",
+        "last",
+        "nth",
+    ];
+
     let locator = rest.get(0).ok_or_else(|| ParseError::MissingArguments {
         context: "find".to_string(),
         usage: "find <locator> <value> [action] [text]",
     })?;
-    
+
     let name_idx = rest.iter().position(|&s| s == "--name");
     let name = name_idx.and_then(|i| rest.get(i + 1).map(|s| *s));
     let exact = rest.iter().any(|&s| s == "--exact");
 
     match *locator {
-        "role" | "text" | "label" | "placeholder" | "alt" | "title" | "testid" | "first" | "last" => {
+        "role" | "text" | "label" | "placeholder" | "alt" | "title" | "testid" | "first"
+        | "last" => {
             let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: format!("find {}", locator),
                 usage: match *locator {
@@ -811,10 +877,12 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "find nth".to_string(),
                 usage: "find nth <index> <selector> [action] [text]",
             })?;
-            let idx = idx_str.parse::<i32>().map_err(|_| ParseError::MissingArguments {
-                context: "find nth".to_string(),
-                usage: "find nth <index> <selector> [action] [text]",
-            })?;
+            let idx = idx_str
+                .parse::<i32>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "find nth".to_string(),
+                    usage: "find nth <index> <selector> [action] [text]",
+                })?;
             let sel = rest.get(2).ok_or_else(|| ParseError::MissingArguments {
                 context: "find nth".to_string(),
                 usage: "find nth <index> <selector> [action] [text]",
@@ -838,7 +906,7 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 
 fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["move", "down", "up", "wheel"];
-    
+
     match rest.get(0).map(|s| *s) {
         Some("move") => {
             let x_str = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -849,14 +917,18 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "mouse move".to_string(),
                 usage: "mouse move <x> <y>",
             })?;
-            let x = x_str.parse::<i32>().map_err(|_| ParseError::MissingArguments {
-                context: "mouse move".to_string(),
-                usage: "mouse move <x> <y>",
-            })?;
-            let y = y_str.parse::<i32>().map_err(|_| ParseError::MissingArguments {
-                context: "mouse move".to_string(),
-                usage: "mouse move <x> <y>",
-            })?;
+            let x = x_str
+                .parse::<i32>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "mouse move".to_string(),
+                    usage: "mouse move <x> <y>",
+                })?;
+            let y = y_str
+                .parse::<i32>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "mouse move".to_string(),
+                    usage: "mouse move <x> <y>",
+                })?;
             Ok(json!({ "id": id, "action": "mousemove", "x": x, "y": y }))
         }
         Some("down") => {
@@ -866,7 +938,10 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             Ok(json!({ "id": id, "action": "mouseup", "button": rest.get(1).unwrap_or(&"left") }))
         }
         Some("wheel") => {
-            let dy = rest.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(100);
+            let dy = rest
+                .get(1)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(100);
             let dx = rest.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
             Ok(json!({ "id": id, "action": "wheel", "deltaX": dx, "deltaY": dy }))
         }
@@ -882,8 +957,18 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 }
 
 fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
-    const VALID: &[&str] = &["viewport", "device", "geo", "geolocation", "offline", "headers", "credentials", "auth", "media"];
-    
+    const VALID: &[&str] = &[
+        "viewport",
+        "device",
+        "geo",
+        "geolocation",
+        "offline",
+        "headers",
+        "credentials",
+        "auth",
+        "media",
+    ];
+
     match rest.get(0).map(|s| *s) {
         Some("viewport") => {
             let w_str = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -894,14 +979,18 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "set viewport".to_string(),
                 usage: "set viewport <width> <height>",
             })?;
-            let w = w_str.parse::<i32>().map_err(|_| ParseError::MissingArguments {
-                context: "set viewport".to_string(),
-                usage: "set viewport <width> <height>",
-            })?;
-            let h = h_str.parse::<i32>().map_err(|_| ParseError::MissingArguments {
-                context: "set viewport".to_string(),
-                usage: "set viewport <width> <height>",
-            })?;
+            let w = w_str
+                .parse::<i32>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "set viewport".to_string(),
+                    usage: "set viewport <width> <height>",
+                })?;
+            let h = h_str
+                .parse::<i32>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "set viewport".to_string(),
+                    usage: "set viewport <width> <height>",
+                })?;
             Ok(json!({ "id": id, "action": "viewport", "width": w, "height": h }))
         }
         Some("device") => {
@@ -920,18 +1009,25 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 context: "set geo".to_string(),
                 usage: "set geo <latitude> <longitude>",
             })?;
-            let lat = lat_str.parse::<f64>().map_err(|_| ParseError::MissingArguments {
-                context: "set geo".to_string(),
-                usage: "set geo <latitude> <longitude>",
-            })?;
-            let lng = lng_str.parse::<f64>().map_err(|_| ParseError::MissingArguments {
-                context: "set geo".to_string(),
-                usage: "set geo <latitude> <longitude>",
-            })?;
+            let lat = lat_str
+                .parse::<f64>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "set geo".to_string(),
+                    usage: "set geo <latitude> <longitude>",
+                })?;
+            let lng = lng_str
+                .parse::<f64>()
+                .map_err(|_| ParseError::MissingArguments {
+                    context: "set geo".to_string(),
+                    usage: "set geo <latitude> <longitude>",
+                })?;
             Ok(json!({ "id": id, "action": "geolocation", "latitude": lat, "longitude": lng }))
         }
         Some("offline") => {
-            let off = rest.get(1).map(|s| *s != "off" && *s != "false").unwrap_or(true);
+            let off = rest
+                .get(1)
+                .map(|s| *s != "off" && *s != "false")
+                .unwrap_or(true);
             Ok(json!({ "id": id, "action": "offline", "offline": off }))
         }
         Some("headers") => {
@@ -940,8 +1036,8 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 usage: "set headers <json>",
             })?;
             // Parse the JSON string into an object
-            let headers: serde_json::Value = serde_json::from_str(headers_json)
-                .map_err(|_| ParseError::MissingArguments {
+            let headers: serde_json::Value =
+                serde_json::from_str(headers_json).map_err(|_| ParseError::MissingArguments {
                     context: "set headers".to_string(),
                     usage: "set headers <json> (must be valid JSON object)",
                 })?;
@@ -986,7 +1082,7 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 
 fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["route", "unroute", "requests"];
-    
+
     match rest.get(0).map(|s| *s) {
         Some("route") => {
             let url = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
@@ -1028,7 +1124,7 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 
 fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["local", "session"];
-    
+
     match rest.get(0).map(|s| *s) {
         Some("local") | Some("session") => {
             let storage_type = rest.get(0).unwrap();
@@ -1045,13 +1141,18 @@ fn parse_storage(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                         context: format!("storage {} set", storage_type),
                         usage: "storage <local|session> set <key> <value>",
                     })?;
-                    Ok(json!({ "id": id, "action": "storage_set", "type": storage_type, "key": k, "value": v }))
+                    Ok(
+                        json!({ "id": id, "action": "storage_set", "type": storage_type, "key": k, "value": v }),
+                    )
                 }
                 "clear" => Ok(json!({ "id": id, "action": "storage_clear", "type": storage_type })),
                 _ => {
-                    let mut cmd = json!({ "id": id, "action": "storage_get", "type": storage_type });
+                    let mut cmd =
+                        json!({ "id": id, "action": "storage_get", "type": storage_type });
                     if let Some(k) = key {
-                        cmd.as_object_mut().unwrap().insert("key".to_string(), json!(k));
+                        cmd.as_object_mut()
+                            .unwrap()
+                            .insert("key".to_string(), json!(k));
                     }
                     Ok(cmd)
                 }
@@ -1083,7 +1184,12 @@ mod tests {
             executable_path: None,
             extensions: Vec::new(),
             cdp: None,
+            profile: None,
             proxy: None,
+            proxy_bypass: None,
+            args: None,
+            user_agent: None,
+            provider: None,
         }
     }
 
@@ -1152,7 +1258,8 @@ mod tests {
 
     #[test]
     fn test_storage_local_set() {
-        let cmd = parse_command(&args("storage local set mykey myvalue"), &default_flags()).unwrap();
+        let cmd =
+            parse_command(&args("storage local set mykey myvalue"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "storage_set");
         assert_eq!(cmd["type"], "local");
         assert_eq!(cmd["key"], "mykey");
@@ -1161,7 +1268,8 @@ mod tests {
 
     #[test]
     fn test_storage_session_set() {
-        let cmd = parse_command(&args("storage session set skey svalue"), &default_flags()).unwrap();
+        let cmd =
+            parse_command(&args("storage session set skey svalue"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "storage_set");
         assert_eq!(cmd["type"], "session");
         assert_eq!(cmd["key"], "skey");
@@ -1223,7 +1331,8 @@ mod tests {
     #[test]
     fn test_navigate_with_multiple_headers() {
         let mut flags = default_flags();
-        flags.headers = Some(r#"{"Authorization": "Bearer token", "X-Custom": "value"}"#.to_string());
+        flags.headers =
+            Some(r#"{"Authorization": "Bearer token", "X-Custom": "value"}"#.to_string());
         let cmd = parse_command(&args("open api.example.com"), &flags).unwrap();
         assert_eq!(cmd["headers"]["Authorization"], "Bearer token");
         assert_eq!(cmd["headers"]["X-Custom"], "value");
@@ -1477,7 +1586,10 @@ mod tests {
     fn test_wait_load_missing_state() {
         let result = parse_command(&args("wait --load"), &default_flags());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ParseError::MissingArguments { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingArguments { .. }
+        ));
     }
 
     #[test]
@@ -1576,14 +1688,20 @@ mod tests {
     fn test_unknown_command() {
         let result = parse_command(&args("unknowncommand"), &default_flags());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ParseError::UnknownCommand { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::UnknownCommand { .. }
+        ));
     }
 
     #[test]
     fn test_empty_args() {
         let result = parse_command(&[], &default_flags());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ParseError::MissingArguments { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::MissingArguments { .. }
+        ));
     }
 
     // === Error message tests ===
@@ -1734,5 +1852,100 @@ mod tests {
         let cmd = parse_command(&args("wait -d ./file.pdf"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "waitfordownload");
         assert_eq!(cmd["path"], "./file.pdf");
+    }
+
+    // === Connect (CDP) tests ===
+
+    #[test]
+    fn test_connect_with_port() {
+        let cmd = parse_command(&args("connect 9222"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpPort"], 9222);
+        assert!(cmd.get("cdpUrl").is_none());
+    }
+
+    #[test]
+    fn test_connect_with_ws_url() {
+        let input: Vec<String> = vec![
+            "connect".to_string(),
+            "ws://localhost:9222/devtools/browser/abc123".to_string(),
+        ];
+        let cmd = parse_command(&input, &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpUrl"], "ws://localhost:9222/devtools/browser/abc123");
+        assert!(cmd.get("cdpPort").is_none());
+    }
+
+    #[test]
+    fn test_connect_with_wss_url() {
+        let input: Vec<String> = vec![
+            "connect".to_string(),
+            "wss://remote-browser.example.com/cdp?token=xyz".to_string(),
+        ];
+        let cmd = parse_command(&input, &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpUrl"], "wss://remote-browser.example.com/cdp?token=xyz");
+        assert!(cmd.get("cdpPort").is_none());
+    }
+
+    #[test]
+    fn test_connect_with_http_url() {
+        let input: Vec<String> = vec![
+            "connect".to_string(),
+            "http://localhost:9222".to_string(),
+        ];
+        let cmd = parse_command(&input, &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpUrl"], "http://localhost:9222");
+        assert!(cmd.get("cdpPort").is_none());
+    }
+
+    #[test]
+    fn test_connect_missing_argument() {
+        let result = parse_command(&args("connect"), &default_flags());
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ParseError::MissingArguments { .. }));
+    }
+
+    #[test]
+    fn test_connect_invalid_port() {
+        let result = parse_command(&args("connect notanumber"), &default_flags());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidValue { .. }));
+        assert!(err.format().contains("not a valid port number or URL"));
+    }
+
+    #[test]
+    fn test_connect_port_zero() {
+        let result = parse_command(&args("connect 0"), &default_flags());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidValue { .. }));
+        assert!(err.format().contains("port must be greater than 0"));
+    }
+
+    #[test]
+    fn test_connect_port_out_of_range() {
+        let result = parse_command(&args("connect 65536"), &default_flags());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidValue { .. }));
+        assert!(err.format().contains("out of range"));
+        assert!(err.format().contains("1-65535"));
+    }
+
+    #[test]
+    fn test_connect_port_max_valid() {
+        let cmd = parse_command(&args("connect 65535"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpPort"], 65535);
+    }
+
+    #[test]
+    fn test_connect_port_min_valid() {
+        let cmd = parse_command(&args("connect 1"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["cdpPort"], 1);
     }
 }
